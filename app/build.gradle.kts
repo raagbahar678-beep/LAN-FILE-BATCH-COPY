@@ -8,7 +8,7 @@ android {
     compileSdk = 34
 
     defaultConfig {
-        applicationId = "com.example.myapp"
+        applicationId = "com.example.LANIMAGECOPY"
         minSdk = 29
         targetSdk = 34
         versionCode = 3
