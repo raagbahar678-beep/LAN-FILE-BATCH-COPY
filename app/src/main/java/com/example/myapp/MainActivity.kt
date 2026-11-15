@@ -1580,7 +1580,7 @@ object Core {
         changed()
     }
 
-    fun setTxtAttach(on: Boolean) {
+    fun changeTxtAttach(on: Boolean) {
         txtAttach = on
         prefs.edit().putBoolean("txtattach", on).apply()
         changed()
@@ -2161,7 +2161,7 @@ class MainActivity : Activity() {
         txtCb.textSize = 14f
         txtCb.isChecked = Core.txtAttach
         txtCb.isFocusable = false
-        txtCb.setOnCheckedChangeListener { _, c -> Core.setTxtAttach(c) }
+        txtCb.setOnCheckedChangeListener { _, c -> Core.changeTxtAttach(c) }
         root.addView(txtCb)
         val pickTxtB = mkBtn("Choose txt files") { pickTxt() }
         val clearTxtB = mkBtn("Clear txt files") { Core.clearTxt() }
