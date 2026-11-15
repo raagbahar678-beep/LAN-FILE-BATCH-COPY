@@ -39,11 +39,8 @@ import android.os.PowerManager
 import android.provider.DocumentsContract
 import android.provider.OpenableColumns
 import android.provider.Settings
-import android.text.Editable
-import android.text.InputFilter
 import android.text.InputType
 import android.text.TextUtils
-import android.text.TextWatcher
 import android.view.Gravity
 import android.view.KeyEvent
 import android.view.MotionEvent
@@ -97,6 +94,9 @@ import java.util.concurrent.atomic.AtomicInteger
 class FileItem(val name: String, val docId: String)
 
 class ListRes(val items: ArrayList<FileItem>, val error: String)
+
+// A text file chosen by the user to travel with every batch.
+class TxtItem(val uri: String, val name: String)
 
 // Natural order: 1, 2, 3 ... 10, 11 (not 1, 10, 11, 2). Works for "5.pdf", "file7.txt", "IMG_0012.jpg" and so on.
 fun natCompare(a: String, b: String): Int {
@@ -1474,18 +1474,12 @@ object Core {
     var loadCount: Int = 0
     var lanOn: Boolean = false
 
-    const val MAX_TEXT = 150000
-
-    // The extra text that is pasted together with the files.
+    // Text files chosen with "Choose txt files" (any size - they are streamed, never loaded into memory).
     @Volatile
-    var sideText: String = ""
+    var txtFiles: List<TxtItem> = emptyList()
 
     @Volatile
-    var attachText: Boolean = true
-
-    @Volatile
-    var textDropped: Boolean = false
-    private val textLock = Any()
+    var txtAttach: Boolean = true
 
     @Volatile
     private var loadToken: Int = 0
@@ -1504,54 +1498,140 @@ object Core {
             reload()
         }
         lanOn = prefs.getBoolean("lanon", false)
-        attachText = prefs.getBoolean("attach", true)
-        loadSideText()
+        txtAttach = prefs.getBoolean("txtattach", true)
+        loadTxt()
         if (lanOn) startLanNow()
     }
 
-    // ---------- Extra text (saved in its own file so the app never slows down) ----------
+    // ---------- Chosen txt files ----------
 
-    private fun textFile(): File {
-        return File(app.filesDir, "side_text.txt")
-    }
-
-    private fun loadSideText() {
+    private fun loadTxt() {
         try {
-            val f = textFile()
-            if (f.exists() && f.length() < 2000000L) {
-                sideText = f.readText(Charsets.UTF_8).take(MAX_TEXT)
+            val sv = prefs.getString("txtfiles", null) ?: return
+            val a = JSONArray(sv)
+            val out = ArrayList<TxtItem>()
+            for (k in 0 until a.length()) {
+                val o = a.getJSONObject(k)
+                out.add(TxtItem(o.getString("u"), o.getString("n")))
             }
+            txtFiles = out
         } catch (e: Exception) {
         }
     }
 
-    // Writes the current text to disk on a background thread.
-    fun persistText() {
+    private fun saveTxt() {
+        try {
+            val a = JSONArray()
+            for (t in txtFiles) {
+                val o = JSONObject()
+                o.put("u", t.uri)
+                o.put("n", t.name)
+                a.put(o)
+            }
+            prefs.edit().putString("txtfiles", a.toString()).apply()
+        } catch (e: Exception) {
+        }
+    }
+
+    // Reads the file names on a background thread, then shows the new list.
+    fun setTxtFromUris(uris: List<Uri>) {
+        val old = txtFiles
         Thread {
-            synchronized(textLock) {
+            val out = ArrayList<TxtItem>()
+            for (u in uris) {
+                var name = "text.txt"
                 try {
-                    textFile().writeText(sideText, Charsets.UTF_8)
+                    app.contentResolver.query(u, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { c ->
+                        if (c.moveToFirst() && !c.isNull(0)) {
+                            name = c.getString(0)
+                        }
+                    }
                 } catch (e: Exception) {
                 }
+                out.add(TxtItem(u.toString(), name))
+            }
+            main.post {
+                txtFiles = out
+                saveTxt()
+                for (o in old) {
+                    var keep = false
+                    for (n in out) {
+                        if (n.uri == o.uri) keep = true
+                    }
+                    if (!keep) {
+                        try {
+                            app.contentResolver.releasePersistableUriPermission(
+                                Uri.parse(o.uri), Intent.FLAG_GRANT_READ_URI_PERMISSION
+                            )
+                        } catch (e: Exception) {
+                        }
+                    }
+                }
+                lastMsg = out.size.toString() + " txt file(s) chosen. They are copied with every batch."
+                changed()
             }
         }.start()
     }
 
-    fun setAttach(on: Boolean) {
-        attachText = on
-        prefs.edit().putBoolean("attach", on).apply()
+    fun clearTxt() {
+        txtFiles = emptyList()
+        saveTxt()
+        lastMsg = "Chosen txt files cleared."
+        changed()
     }
 
-    // The text to paste with the files, or null when the box is empty or switched off.
-    fun activeText(): String? {
-        val t = sideText
-        return if (attachText && t.isNotBlank()) t else null
+    fun setTxtAttach(on: Boolean) {
+        txtAttach = on
+        prefs.edit().putBoolean("txtattach", on).apply()
+        changed()
+    }
+
+    // Only the chosen files that can still be opened (a moved or deleted file is skipped).
+    fun usableTxt(): List<TxtItem> {
+        val out = ArrayList<TxtItem>()
+        if (!txtAttach) return out
+        for (t in txtFiles) {
+            try {
+                val pfd = app.contentResolver.openFileDescriptor(Uri.parse(t.uri), "r")
+                if (pfd != null) {
+                    pfd.close()
+                    out.add(t)
+                }
+            } catch (e: Exception) {
+            }
+        }
+        return out
+    }
+
+    fun txtProviderUri(t: TxtItem): Uri {
+        return Uri.Builder()
+            .scheme("content")
+            .authority(AUTH)
+            .appendPath(t.uri)
+            .appendPath(t.name)
+            .build()
+    }
+
+    fun txtSummary(): String {
+        val l = txtFiles
+        if (l.isEmpty()) return "No txt files chosen."
+        val sb = StringBuilder()
+        sb.append(l.size).append(" txt file(s): ")
+        for (k in 0 until minOf(l.size, 5)) {
+            if (k > 0) sb.append(", ")
+            sb.append(l[k].name)
+        }
+        if (l.size > 5) sb.append(" ...")
+        if (!txtAttach) sb.append("   (switched off)")
+        return sb.toString()
     }
 
     private fun textNote(): String {
-        if (activeText() == null) return ""
-        if (textDropped) return "\n(The text was too big for the clipboard, so only the files were copied.)"
-        return "\n+ your text (" + sideText.length + " characters) is copied with the files."
+        val n = usableTxt().size
+        if (n > 0) {
+            return "\n+ " + n + " chosen txt file(s) copied with the files."
+        }
+        return ""
     }
 
     fun addListener(r: Runnable) {
@@ -1637,10 +1717,10 @@ object Core {
             for (it2 in items) {
                 uris.add(docUri(it2))
             }
-            val texts = ArrayList<String>()
-            val st = activeText()
-            if (st != null) texts.add(st)
-            lan().copyFiles(uris, texts)
+            for (t in usableTxt()) {
+                uris.add(Uri.parse(t.uri))
+            }
+            lan().copyFiles(uris, ArrayList<String>())
         } catch (ex: Exception) {
             lastMsg = "LAN send failed: " + ex.message
         }
@@ -1824,15 +1904,15 @@ object Core {
     fun buildClip(items: List<FileItem>, withText: Boolean = true): ClipData {
         val mimes = LinkedHashSet<String>()
         for (e in items) mimes.add(mimeOfName(e.name))
-        val txt: String? = if (withText) activeText() else null
-        if (txt != null) mimes.add("text/plain")
+        val extra: List<TxtItem> = if (withText) usableTxt() else ArrayList<TxtItem>()
+        for (t in extra) mimes.add(mimeOfName(t.name))
         val desc = ClipDescription("files", mimes.toTypedArray())
         val clip = ClipData(desc, ClipData.Item(providerUri(items[0])))
         for (k in 1 until items.size) {
             clip.addItem(ClipData.Item(providerUri(items[k])))
         }
-        if (txt != null) {
-            clip.addItem(ClipData.Item(txt))
+        for (t in extra) {
+            clip.addItem(ClipData.Item(txtProviderUri(t)))
         }
         return clip
     }
@@ -1851,21 +1931,11 @@ object Core {
     }
 
     private fun putOnClipboard(items: List<FileItem>): String? {
-        textDropped = false
-        val cm = app.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
         try {
+            val cm = app.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
             cm.setPrimaryClip(buildClip(items))
             return null
         } catch (e: Exception) {
-            if (activeText() != null) {
-                try {
-                    cm.setPrimaryClip(buildClip(items, false))
-                    textDropped = true
-                    return null
-                } catch (e2: Exception) {
-                    return "Copy failed: " + e2.message
-                }
-            }
             return "Copy failed: " + e.message
         }
     }
@@ -1985,6 +2055,7 @@ class MainActivity : Activity() {
     companion object {
         const val REQ_TREE = 101
         const val REQ_NOTIF = 102
+        const val REQ_TXT = 104
         const val REQ_LAN = 103
     }
 
@@ -1994,9 +2065,7 @@ class MainActivity : Activity() {
     private lateinit var strip: LinearLayout
     private lateinit var stripScroll: HorizontalScrollView
     private lateinit var lanB: Button
-    private lateinit var sideEdit: EditText
-    private lateinit var sideCount: TextView
-    private val saveText = Runnable { Core.persistText() }
+    private lateinit var txtInfo: TextView
 
     private var thumbToken: Int = 0
     private var lastThumbKey: String = ""
@@ -2019,7 +2088,6 @@ class MainActivity : Activity() {
         super.onPause()
         Core.removeListener(ui)
         Core.save()
-        Core.persistText()
     }
 
     // ---------- UI ----------
@@ -2087,51 +2155,21 @@ class MainActivity : Activity() {
         val gotB = mkBtn("Copy received") { report(Core.copyReceived()) }
         root.addView(mkRow(lanB, devB, gotB))
 
-        // Extra text that is pasted together with the files
-        val attachCb = CheckBox(this)
-        attachCb.text = "Paste this text with the files"
-        attachCb.textSize = 14f
-        attachCb.isChecked = Core.attachText
-        attachCb.isFocusable = false
-        attachCb.setOnCheckedChangeListener { _, c -> Core.setAttach(c) }
-        val clearTextB = mkBtn("Clear text") { sideEdit.setText("") }
-        val textRow = LinearLayout(this)
-        textRow.orientation = LinearLayout.HORIZONTAL
-        textRow.gravity = Gravity.CENTER_VERTICAL
-        textRow.addView(attachCb, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 2f))
-        textRow.addView(clearTextB, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
-        root.addView(textRow)
-
-        sideEdit = EditText(this)
-        sideEdit.hint = "Type or paste text here. It is copied along with every batch of files."
-        sideEdit.textSize = 14f
-        sideEdit.inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE or
-            InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
-        sideEdit.gravity = Gravity.TOP or Gravity.START
-        sideEdit.isVerticalScrollBarEnabled = true
-        sideEdit.filters = arrayOf<InputFilter>(InputFilter.LengthFilter(Core.MAX_TEXT))
-        sideEdit.setText(Core.sideText)
-        sideEdit.addTextChangedListener(object : TextWatcher {
-            override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {
-            }
-
-            override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {
-            }
-
-            override fun afterTextChanged(s: Editable?) {
-                val t = s?.toString() ?: ""
-                Core.sideText = t
-                sideCount.text = t.length.toString() + " / " + Core.MAX_TEXT + " characters"
-                sideEdit.removeCallbacks(saveText)
-                sideEdit.postDelayed(saveText, 800)
-            }
-        })
-        root.addView(sideEdit, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(110)))
-        sideCount = TextView(this)
-        sideCount.textSize = 11f
-        sideCount.setPadding(dp(6), dp(1), dp(6), dp(1))
-        sideCount.text = Core.sideText.length.toString() + " / " + Core.MAX_TEXT + " characters"
-        root.addView(sideCount)
+        // Text files (any size) that travel with every batch
+        val txtCb = CheckBox(this)
+        txtCb.text = "Also copy my chosen txt file(s) with every batch"
+        txtCb.textSize = 14f
+        txtCb.isChecked = Core.txtAttach
+        txtCb.isFocusable = false
+        txtCb.setOnCheckedChangeListener { _, c -> Core.setTxtAttach(c) }
+        root.addView(txtCb)
+        val pickTxtB = mkBtn("Choose txt files") { pickTxt() }
+        val clearTxtB = mkBtn("Clear txt files") { Core.clearTxt() }
+        root.addView(mkRow(pickTxtB, clearTxtB))
+        txtInfo = TextView(this)
+        txtInfo.textSize = 12f
+        txtInfo.setPadding(dp(6), dp(2), dp(6), dp(6))
+        root.addView(txtInfo)
 
         status = TextView(this)
         status.textSize = 15f
@@ -2164,8 +2202,8 @@ class MainActivity : Activity() {
             "After Copy: open the other app, tap in the box, then paste (long-press > Paste, or Ctrl+V).\n" +
             "Float on top: shows a small panel over every app. Drag the top bar to move it, drag the " +
             "bottom-right corner (finger or mouse) to resize it.\n" +
-            "Text box: whatever you type or paste there (up to 150,000 characters) is copied together with " +
-            "every batch of files, and sent to your other phones when LAN copy is ON. Untick the box to turn it off.\n" +
+            "Choose txt files: pick one or more text files (any size). They are copied together with every batch " +
+            "and sent to your other phones when LAN copy is ON. Large files are streamed, so the app does not freeze.\n" +
             "Keys: C copy batch, O copy one, S share, B previous, R reset, F float, L LAN on/off.\n" +
             "LAN copy: turn it ON in this app on every phone (same Wi-Fi). Then every Copy batch / Copy one " +
             "is also sent to the other phones and lands on their clipboards, ready to paste. " +
@@ -2206,8 +2244,37 @@ class MainActivity : Activity() {
         startActivityForResult(i, REQ_TREE)
     }
 
+    private fun pickTxt() {
+        val i = Intent(Intent.ACTION_OPEN_DOCUMENT)
+        i.addCategory(Intent.CATEGORY_OPENABLE)
+        i.type = "*/*"
+        i.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true)
+        i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION)
+        startActivityForResult(i, REQ_TXT)
+    }
+
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode == REQ_TXT && resultCode == RESULT_OK && data != null) {
+            val uris = ArrayList<Uri>()
+            val cd = data.clipData
+            if (cd != null) {
+                for (k in 0 until cd.itemCount) {
+                    val u = cd.getItemAt(k).uri
+                    if (u != null) uris.add(u)
+                }
+            } else {
+                val u = data.data
+                if (u != null) uris.add(u)
+            }
+            for (u in uris) {
+                try {
+                    contentResolver.takePersistableUriPermission(u, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                } catch (e: Exception) {
+                }
+            }
+            if (uris.isNotEmpty()) Core.setTxtFromUris(uris)
+        }
         if (requestCode == REQ_TREE && resultCode == RESULT_OK && data != null) {
             val u = data.data
             if (u != null) {
@@ -2224,6 +2291,7 @@ class MainActivity : Activity() {
     // ---------- Display ----------
 
     private fun refreshAll() {
+        txtInfo.text = Core.txtSummary()
         status.text = Core.statusText(false)
         lanB.text = if (Core.lanOn) "LAN copy: ON" else "LAN copy: OFF"
         if (!batchEdit.hasFocus() && batchEdit.text.toString() != Core.batch.toString()) {
@@ -2346,16 +2414,18 @@ class MainActivity : Activity() {
             for (e in items) {
                 uris.add(Core.providerUri(e))
             }
+            val extraTxt = Core.usableTxt()
+            for (t in extraTxt) {
+                uris.add(Core.txtProviderUri(t))
+            }
             val i = Intent(if (uris.size == 1) Intent.ACTION_SEND else Intent.ACTION_SEND_MULTIPLE)
             if (uris.size == 1) {
                 i.putExtra(Intent.EXTRA_STREAM, uris[0])
             } else {
                 i.putParcelableArrayListExtra(Intent.EXTRA_STREAM, uris)
             }
-            i.type = Core.shareType(items)
-            val st = Core.activeText()
-            if (st != null) i.putExtra(Intent.EXTRA_TEXT, st)
-            i.clipData = Core.buildClip(items, false)
+            i.type = if (extraTxt.isNotEmpty()) "*/*" else Core.shareType(items)
+            i.clipData = Core.buildClip(items)
             i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
             startActivity(Intent.createChooser(i, "Share files"))
             Core.afterShare(items)
