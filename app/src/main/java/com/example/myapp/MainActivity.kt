@@ -1998,6 +1998,20 @@ object Core {
         changed()
     }
 
+    // Jump so that the next batch starts at file number n (1 = first file in the list).
+    // Returns an error text, or null when fine.
+    fun jumpTo(n: Int): String? {
+        val total = files.size
+        if (treeUri == null || total == 0) return "Pick a folder first."
+        if (n < 1 || n > total) return "Enter a file number from 1 to " + total + "."
+        pos = n - 1
+        sub = 0
+        lastMsg = "Jumped to file " + n + " (" + files[pos].name + ")."
+        save()
+        changed()
+        return null
+    }
+
     fun resetAll() {
         pos = 0
         sub = 0
@@ -2038,7 +2052,8 @@ object Core {
         sb.append("Folder: ").append(total).append(" files   |   Batch: ").append(batch)
         if (loading) sb.append("   (updating...)")
         sb.append("\n")
-        sb.append("Next: ").append(files[pos].name).append(" to ").append(files[end - 1].name)
+        sb.append("Next: #").append(pos + 1).append(" ").append(files[pos].name)
+            .append(" to #").append(end).append(" ").append(files[end - 1].name)
             .append("  (").append(end - pos).append(" files)\n")
         if (sub > 0 && pos + sub < end) {
             sb.append("Copy one: next is ").append(files[pos + sub].name).append("\n")
@@ -2062,6 +2077,7 @@ class MainActivity : Activity() {
     private lateinit var rootView: LinearLayout
     private lateinit var status: TextView
     private lateinit var batchEdit: EditText
+    private lateinit var jumpEdit: EditText
     private lateinit var strip: LinearLayout
     private lateinit var stripScroll: HorizontalScrollView
     private lateinit var lanB: Button
@@ -2145,6 +2161,19 @@ class MainActivity : Activity() {
         val resetB = mkBtn("Reset to 1") { Core.resetAll() }
         val refreshB = mkBtn("Refresh list") { Core.reload() }
         root.addView(mkRow(prevB, resetB, refreshB))
+
+        // Jump straight to any file number
+        jumpEdit = EditText(this)
+        jumpEdit.inputType = InputType.TYPE_CLASS_NUMBER
+        jumpEdit.gravity = Gravity.CENTER
+        jumpEdit.hint = "File no."
+        jumpEdit.imeOptions = EditorInfo.IME_ACTION_GO
+        jumpEdit.setOnEditorActionListener { _, _, _ ->
+            applyJump()
+            true
+        }
+        val jumpB = mkBtn("Jump to file") { applyJump() }
+        root.addView(mkRow(jumpEdit, jumpB))
 
         val floatB = mkBtn("Float on top") { startFloat() }
         val stopFloatB = mkBtn("Stop float") { stopFloat() }
@@ -2401,6 +2430,23 @@ class MainActivity : Activity() {
         batchEdit.clearFocus()
         rootView.requestFocus()
         Core.changeBatch(n)
+    }
+
+    private fun applyJump() {
+        val n: Int? = jumpEdit.text.toString().trim().toIntOrNull()
+        if (n == null || n < 1) {
+            toast("Enter a file number, 1 or more")
+            return
+        }
+        val err = Core.jumpTo(n)
+        if (err != null) {
+            toast(err)
+            return
+        }
+        hideKeyboard()
+        jumpEdit.clearFocus()
+        jumpEdit.setText("")
+        rootView.requestFocus()
     }
 
     private fun shareBatch() {
